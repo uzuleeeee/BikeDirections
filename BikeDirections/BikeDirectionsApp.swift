@@ -11,7 +11,8 @@ import SwiftUI
 struct BikeDirectionsApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
+//            ContentView()
+            BLETestView()
         }
     }
 }
