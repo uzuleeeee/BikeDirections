@@ -211,15 +211,33 @@ final class MapViewModel: NSObject, ObservableObject, CLLocationManagerDelegate 
             return
         }
 
-        if let reachedStep = routeRetriever.advanceIfNeeded(for: latest, threshold: breakpointTriggerDistance) {
-            bluetoothManager?.sendTurnInstruction(for: reachedStep)
-
+        // 1. Check if we've reached the current breakpoint (the turn)
+        if let _ = routeRetriever.advanceIfNeeded(for: latest, threshold: breakpointTriggerDistance) {
             if let nextStep = routeRetriever.getCurrentStep() {
                 currentInstruction = nextStep.instructions
             } else {
                 currentInstruction = "Arrived at \(selectedDestination?.name ?? "destination")"
                 isNavigating = false
+                
+                // Send an "Arrived" signal (Direction 0, Distance 0)
+                bluetoothManager?.sendNavigationUpdate(direction: 0, distance: 0)
+                return
             }
+        }
+        
+        // 2. Continuously stream current instruction and distance to the ESP32
+        if let distanceToTurn = routeRetriever.distanceToCurrentBreakpoint(from: latest) {
+            let normalizedInstruction = currentInstruction.lowercased()
+            var directionCode: UInt8 = 0 // Default to 0 (Straight / Continue)
+            
+            if normalizedInstruction.contains("left") {
+                directionCode = 1
+            } else if normalizedInstruction.contains("right") {
+                directionCode = 2
+            }
+            
+            // Send the stream!
+            bluetoothManager?.sendNavigationUpdate(direction: directionCode, distance: Int(distanceToTurn))
         }
     }
 

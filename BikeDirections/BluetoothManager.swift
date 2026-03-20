@@ -122,4 +122,29 @@ class BluetoothManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
             sendCommand(2)
         }
     }
+    
+    func sendNavigationUpdate(direction: UInt8, distance: Int) {
+        guard let peripheral = esp32Peripheral, let characteristic = writeCharacteristic else {
+            return
+        }
+        
+        // Clamp distance to a 16-bit integer maximum (65535 meters) to fit in 2 bytes safely
+        let clampedDistance = UInt16(clamping: distance)
+        
+        // Create a 3-byte payload
+        let bytes: [UInt8] = [
+            direction,
+            UInt8(clampedDistance >> 8),   // High byte of distance
+            UInt8(clampedDistance & 0xFF)  // Low byte of distance
+        ]
+        
+        let data = Data(bytes)
+        
+        // Note: For continuous streaming, .withoutResponse is typically better for performance
+        // to avoid bottlenecking the BLE connection. If your ESP characteristic requires a response, leave this as .withResponse.
+        peripheral.writeValue(data, for: characteristic, type: .withResponse)
+        
+        // Optional: Print to console for debugging
+        // print("Streaming BLE -> Dir: \(direction), Dist: \(distance)m")
+    }
 }
