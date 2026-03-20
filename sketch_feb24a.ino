@@ -14,6 +14,13 @@ const int rightMotorPin = 26;
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
 
+// Variables for non-blocking timing
+unsigned long leftMotorStartTime = 0;
+unsigned long rightMotorStartTime = 0;
+bool leftMotorActive = false;
+bool rightMotorActive = false;
+const unsigned long motorPulseDuration = 500; // How long the motor stays on (in milliseconds)
+
 // 1. Callback class to handle device connection/disconnection
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
@@ -30,25 +37,49 @@ class MyServerCallbacks: public BLEServerCallbacks {
 // 2. Callback class to handle incoming data from the iPhone
 class MyCallbacks: public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic *pCharacteristic) {
-      // 👇 FIX 1: We use the Arduino 'String' type now
+      // Get the raw data payload
       String rxValue = pCharacteristic->getValue();
 
-      if (rxValue.length() > 0) {
-        // 👇 FIX 2: safely grab the first byte of the payload
+      // Check if we received our expected 3-byte payload
+      if (rxValue.length() == 3) {
+        
+        // Byte 0: Direction Command
         uint8_t command = (uint8_t)rxValue[0]; 
         
+        // Bytes 1 & 2: Distance
+        uint16_t distance = ((uint8_t)rxValue[1] << 8) | (uint8_t)rxValue[2];
+
+        // --- NEW: Format the output as (direction, distance m) ---
+        String directionString = "unknown";
         if (command == 1) {
-          Serial.println("⬅️ Received Left Command");
+            directionString = "left";
+        } else if (command == 2) {
+            directionString = "right";
+        } else if (command == 0) {
+            directionString = "straight/arrived";
+        }
+
+        Serial.print("(");
+        Serial.print(directionString);
+        Serial.print(", ");
+        Serial.print(distance);
+        Serial.println(" m)");
+        // ---------------------------------------------------------
+        
+        // Execute your motor/haptic logic based on the command
+        if (command == 1) {
           digitalWrite(leftMotorPin, HIGH);
-          delay(500); 
-          digitalWrite(leftMotorPin, LOW);
+          leftMotorActive = true;
+          leftMotorStartTime = millis(); // Start the stopwatch
           
         } else if (command == 2) {
-          Serial.println("➡️ Received Right Command");
           digitalWrite(rightMotorPin, HIGH);
-          delay(500); 
-          digitalWrite(rightMotorPin, LOW);
+          rightMotorActive = true;
+          rightMotorStartTime = millis(); // Start the stopwatch
+          
         }
+      } else {
+         Serial.println("⚠️ Received unexpected payload size.");
       }
     }
 };
@@ -101,16 +132,28 @@ void setup() {
 void loop() {
   // If the device just disconnected
   if (!deviceConnected && oldDeviceConnected) {
-      delay(500); // Give the Bluetooth stack time to fully sever the connection
-      BLEDevice::startAdvertising(); // Safely restart advertising
+      delay(500); // This delay is fine because we are disconnected anyway
+      BLEDevice::startAdvertising(); 
       Serial.println("📡 Restarted Advertising. Waiting to reconnect...");
       oldDeviceConnected = deviceConnected;
   }
 
   // If the device just connected
   if (deviceConnected && !oldDeviceConnected) {
-      // Do nothing, just update the state tracker
       oldDeviceConnected = deviceConnected;
+  }
+
+  // Constantly check our stopwatches
+  unsigned long currentMillis = millis();
+
+  if (leftMotorActive && (currentMillis - leftMotorStartTime >= motorPulseDuration)) {
+      digitalWrite(leftMotorPin, LOW);
+      leftMotorActive = false;
+  }
+
+  if (rightMotorActive && (currentMillis - rightMotorStartTime >= motorPulseDuration)) {
+      digitalWrite(rightMotorPin, LOW);
+      rightMotorActive = false;
   }
   
   delay(10); // Small delay to keep the loop running smoothly
