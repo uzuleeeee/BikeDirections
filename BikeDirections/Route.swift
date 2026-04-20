@@ -2,7 +2,6 @@ import Foundation
 import MapKit
 import CoreLocation
 
-// RouteDetails remains exactly the same
 struct RouteDetails {
     let name: String
     let distanceMeters: Double
@@ -31,28 +30,41 @@ struct RouteDetails {
 }
 
 final class RouteService {
-    // 1. Add transportType parameter (default to .walking for biking proxy)
-    func fetchRoute(for sr: SearchResult, transportType: MKDirectionsTransportType = .walking) async throws -> MKRoute? {
+    func fetchRoute(
+        for sr: SearchResult,
+        from sourceCoordinate: CLLocationCoordinate2D? = nil,
+        transportType: MKDirectionsTransportType = .cycling
+    ) async throws -> MKRoute? {
         let destination = MKMapItem(
             placemark: MKPlacemark(coordinate: sr.coordinate)
         )
 
         let request = MKDirections.Request()
-        request.source = MKMapItem.forCurrentLocation()
+        if let sourceCoordinate {
+            request.source = MKMapItem(placemark: MKPlacemark(coordinate: sourceCoordinate))
+        } else {
+            request.source = MKMapItem.forCurrentLocation()
+        }
         request.destination = destination
-        
-        // 2. Apply the dynamic transport type instead of hardcoded .automobile
         request.transportType = transportType
+        request.requestsAlternateRoutes = true
 
         let directions = MKDirections(request: request)
         let response = try await directions.calculate()
 
-        return response.routes.first
+        return response.routes.min { $0.expectedTravelTime < $1.expectedTravelTime }
     }
 
-    // 3. Pass the transport type through the retriever fetcher
-    func fetchRouteRetriever(for sr: SearchResult, transportType: MKDirectionsTransportType = .walking) async throws -> RouteRetriever? {
-        guard let route = try await fetchRoute(for: sr, transportType: transportType) else {
+    func fetchRouteRetriever(
+        for sr: SearchResult,
+        from sourceCoordinate: CLLocationCoordinate2D? = nil,
+        transportType: MKDirectionsTransportType = .cycling
+    ) async throws -> RouteRetriever? {
+        guard let route = try await fetchRoute(
+            for: sr,
+            from: sourceCoordinate,
+            transportType: transportType
+        ) else {
             return nil
         }
 
@@ -73,23 +85,16 @@ final class RouteService {
     }
 }
 
-// RouteRetriever and MKPolyline extension remain exactly the same
 final class RouteRetriever {
     let route: MKRoute
     private let navigableSteps: [MKRoute.Step]
-    private(set) var currentStep: Int
+    private(set) var currentSegmentIndex = 0
 
-    init(route: MKRoute, currentStep: Int = 0) {
+    init(route: MKRoute) {
         self.route = route
         self.navigableSteps = route.steps.filter { step in
             !step.instructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
             step.polyline.pointCount > 0
-        }
-
-        if navigableSteps.isEmpty {
-            self.currentStep = 0
-        } else {
-            self.currentStep = min(max(currentStep, 0), navigableSteps.count - 1)
         }
     }
 
@@ -101,44 +106,23 @@ final class RouteRetriever {
         navigableSteps.count
     }
 
-    var currentRouteStep: MKRoute.Step? {
-        guard navigableSteps.indices.contains(currentStep) else {
+    private var currentSegmentStep: MKRoute.Step? {
+        guard navigableSteps.indices.contains(currentSegmentIndex) else {
             return nil
         }
-        return navigableSteps[currentStep]
+        return navigableSteps[currentSegmentIndex]
     }
 
     var currentInstruction: String {
-        currentRouteStep?.instructions ?? "Continue"
+        currentSegmentStep?.instructions ?? "Continue"
+    }
+
+    var hasArrived: Bool {
+        currentSegmentIndex >= navigableSteps.count
     }
 
     var currentBreakpointCoordinate: CLLocationCoordinate2D? {
-        currentRouteStep?.polyline.lastCoordinate
-    }
-
-    func getCurrentStep() -> MKRoute.Step? {
-        currentRouteStep
-    }
-
-    func nextStep() -> MKRoute.Step? {
-        let nextIndex = currentStep + 1
-        guard navigableSteps.indices.contains(nextIndex) else {
-            currentStep = navigableSteps.count
-            return nil
-        }
-
-        currentStep = nextIndex
-        return navigableSteps[currentStep]
-    }
-
-    func prevStep() -> MKRoute.Step? {
-        let previousIndex = currentStep - 1
-        guard navigableSteps.indices.contains(previousIndex) else {
-            return nil
-        }
-
-        currentStep = previousIndex
-        return navigableSteps[currentStep]
+        currentSegmentStep?.polyline.lastCoordinate
     }
 
     func distanceToCurrentBreakpoint(from location: CLLocation) -> CLLocationDistance? {
@@ -151,21 +135,37 @@ final class RouteRetriever {
     }
 
     @discardableResult
-    func advanceIfNeeded(for location: CLLocation, threshold: CLLocationDistance = 20) -> MKRoute.Step? {
-        guard let distance = distanceToCurrentBreakpoint(from: location), distance <= threshold else {
+    func advanceIfNeeded(for location: CLLocation, threshold: CLLocationDistance = 20) -> Bool {
+        guard let distance = distanceToCurrentBreakpoint(from: location),
+              distance <= threshold else {
+            return false
+        }
+
+        currentSegmentIndex += 1
+        return true
+    }
+
+    var remainingPolyline: MKPolyline? {
+        guard !hasArrived else {
             return nil
         }
 
-        let reachedStep = currentRouteStep
-        _ = nextStep()
-        return reachedStep
+        let remainingCoordinates = navigableSteps
+            .dropFirst(currentSegmentIndex)
+            .flatMap { $0.polyline.coordinates }
+
+        guard !remainingCoordinates.isEmpty else {
+            return nil
+        }
+
+        return MKPolyline(coordinates: remainingCoordinates, count: remainingCoordinates.count)
     }
 }
 
-private extension MKPolyline {
-    var lastCoordinate: CLLocationCoordinate2D? {
+extension MKPolyline {
+    var coordinates: [CLLocationCoordinate2D] {
         guard pointCount > 0 else {
-            return nil
+            return []
         }
 
         var coordinates = Array(
@@ -173,6 +173,55 @@ private extension MKPolyline {
             count: pointCount
         )
         getCoordinates(&coordinates, range: NSRange(location: 0, length: pointCount))
-        return coordinates.last
+        return coordinates
+    }
+
+    var lastCoordinate: CLLocationCoordinate2D? {
+        coordinates.last
+    }
+
+    func distance(to location: CLLocation) -> CLLocationDistance {
+        let coordinates = self.coordinates
+        guard !coordinates.isEmpty else {
+            return .greatestFiniteMagnitude
+        }
+
+        if coordinates.count == 1 {
+            let onlyPoint = CLLocation(latitude: coordinates[0].latitude, longitude: coordinates[0].longitude)
+            return location.distance(from: onlyPoint)
+        }
+
+        let userPoint = MKMapPoint(location.coordinate)
+        var minimumDistance = CLLocationDistance.greatestFiniteMagnitude
+
+        for index in 0..<(coordinates.count - 1) {
+            let start = MKMapPoint(coordinates[index])
+            let end = MKMapPoint(coordinates[index + 1])
+            let closestPoint = userPoint.closestPoint(onSegmentFrom: start, to: end)
+            let distance = userPoint.distance(to: closestPoint)
+            minimumDistance = min(minimumDistance, distance)
+        }
+
+        return minimumDistance
+    }
+}
+
+private extension MKMapPoint {
+    func closestPoint(onSegmentFrom start: MKMapPoint, to end: MKMapPoint) -> MKMapPoint {
+        let dx = end.x - start.x
+        let dy = end.y - start.y
+        let segmentLengthSquared = (dx * dx) + (dy * dy)
+
+        guard segmentLengthSquared > 0 else {
+            return start
+        }
+
+        let projection = ((x - start.x) * dx + (y - start.y) * dy) / segmentLengthSquared
+        let clampedProjection = min(max(projection, 0), 1)
+
+        return MKMapPoint(
+            x: start.x + (clampedProjection * dx),
+            y: start.y + (clampedProjection * dy)
+        )
     }
 }

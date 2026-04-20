@@ -19,6 +19,7 @@ final class MapViewModel: NSObject, ObservableObject, CLLocationManagerDelegate 
     @Published var currentInstruction = "Choose a destination to begin"
     @Published var isNavigating = false
     @Published var shouldFitRoute = false
+    @Published var shouldRecenter = false
     @Published var userCoordinate: CLLocationCoordinate2D?
     @Published var searchText = "" {
         didSet {
@@ -27,11 +28,14 @@ final class MapViewModel: NSObject, ObservableObject, CLLocationManagerDelegate 
             }
         }
     }
-    
-    @Published var transportType: MKDirectionsTransportType = .walking
+
+    @Published var transportType: MKDirectionsTransportType = .cycling
 
     private var isSelecting = false
     private var searchTask: Task<Void, Never>?
+    private var rerouteTask: Task<Void, Never>?
+    private var isRerouting = false
+    private var lastRerouteAt: Date?
 
     private let locationManager = CLLocationManager()
     private let routeService = RouteService()
@@ -40,6 +44,8 @@ final class MapViewModel: NSObject, ObservableObject, CLLocationManagerDelegate 
     private weak var bluetoothManager: BluetoothManager?
 
     private let breakpointTriggerDistance: CLLocationDistance = 20
+    private let offRouteThreshold: CLLocationDistance = 60
+    private let rerouteCooldown: TimeInterval = 12
 
     override init() {
         super.init()
@@ -143,20 +149,18 @@ final class MapViewModel: NSObject, ObservableObject, CLLocationManagerDelegate 
         do {
             guard let retriever = try await routeService.fetchRouteRetriever(
                 for: destination,
-                transportType: self.transportType
+                from: locationManager.location?.coordinate,
+                transportType: transportType
             ) else {
                 currentInstruction = "No route found"
                 return
             }
 
-            routeRetriever = retriever
-            routePolyline = retriever.route.polyline
-            routeDetails = routeService.readRoute(retriever.route)
-            currentInstruction = retriever.currentInstruction
-            isNavigating = true
-            shouldFitRoute = true
-            trackingMode = .follow
-            annotations = [destination]
+            applyRoute(retriever.route, retriever: retriever, fitOnMap: true)
+
+            if let location = locationManager.location {
+                streamNavigationUpdate(from: location)
+            }
         } catch {
             currentInstruction = "Unable to calculate route"
             print("Route error: \(error)")
@@ -164,11 +168,15 @@ final class MapViewModel: NSObject, ObservableObject, CLLocationManagerDelegate 
     }
 
     func stopNavigation(resetDestination: Bool = false) {
+        rerouteTask?.cancel()
+        rerouteTask = nil
+        isRerouting = false
         routeRetriever = nil
         routePolyline = nil
         routeDetails = nil
         isNavigating = false
         shouldFitRoute = false
+        shouldRecenter = false
         currentInstruction = "Choose a destination to begin"
 
         if resetDestination {
@@ -181,6 +189,10 @@ final class MapViewModel: NSObject, ObservableObject, CLLocationManagerDelegate 
         shouldFitRoute = false
     }
 
+    func didRecenterMap() {
+        shouldRecenter = false
+    }
+
     func recenterOnUser() {
         trackingMode = .follow
 
@@ -189,6 +201,7 @@ final class MapViewModel: NSObject, ObservableObject, CLLocationManagerDelegate 
             center: location.coordinate,
             span: MKCoordinateSpan(latitudeDelta: 0.01, longitudeDelta: 0.01)
         )
+        shouldRecenter = true
     }
 
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
@@ -202,51 +215,134 @@ final class MapViewModel: NSObject, ObservableObject, CLLocationManagerDelegate 
 
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         guard let latest = locations.last else { return }
+        guard latest.horizontalAccuracy >= 0, latest.horizontalAccuracy <= 35 else { return }
 
         userCoordinate = latest.coordinate
-
-        if trackingMode != .none {
-            region = MKCoordinateRegion(
-                center: latest.coordinate,
-                span: region.span
-            )
-        }
 
         guard isNavigating, let routeRetriever else {
             return
         }
 
-        // 1. Check if we've reached the current breakpoint (the turn)
-        if let _ = routeRetriever.advanceIfNeeded(for: latest, threshold: breakpointTriggerDistance) {
-            if let nextStep = routeRetriever.getCurrentStep() {
-                currentInstruction = nextStep.instructions
-            } else {
+        if shouldReroute(for: latest, routeRetriever: routeRetriever) {
+            reroute(from: latest)
+            return
+        }
+
+        if routeRetriever.advanceIfNeeded(for: latest, threshold: breakpointTriggerDistance) {
+            routePolyline = routeRetriever.remainingPolyline ?? routeRetriever.route.polyline
+
+            if routeRetriever.hasArrived {
                 currentInstruction = "Arrived at \(selectedDestination?.name ?? "destination")"
                 isNavigating = false
-                
-                // Send an "Arrived" signal (Direction 0, Distance 0)
+                routePolyline = nil
                 bluetoothManager?.sendNavigationUpdate(direction: 0, distance: 0)
                 return
             }
         }
-        
-        // 2. Continuously stream current instruction and distance to the ESP32
-        if let distanceToTurn = routeRetriever.distanceToCurrentBreakpoint(from: latest) {
-            let normalizedInstruction = currentInstruction.lowercased()
-            var directionCode: UInt8 = 0 // Default to 0 (Straight / Continue)
-            
-            if normalizedInstruction.contains("left") {
-                directionCode = 1
-            } else if normalizedInstruction.contains("right") {
-                directionCode = 2
-            }
-            
-            // Send the stream!
-            bluetoothManager?.sendNavigationUpdate(direction: directionCode, distance: Int(distanceToTurn))
-        }
+
+        streamNavigationUpdate(from: latest)
     }
 
     func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
         print("Location error: \(error.localizedDescription)")
+    }
+
+    private func applyRoute(_ route: MKRoute, retriever: RouteRetriever, fitOnMap: Bool) {
+        routeRetriever = retriever
+        routePolyline = retriever.remainingPolyline ?? route.polyline
+        routeDetails = routeService.readRoute(route)
+        currentInstruction = retriever.currentInstruction
+        isNavigating = true
+        shouldFitRoute = fitOnMap
+        trackingMode = .follow
+
+        if let destination = selectedDestination {
+            annotations = [destination]
+        }
+    }
+
+    private func shouldReroute(for location: CLLocation, routeRetriever: RouteRetriever) -> Bool {
+        guard selectedDestination != nil else {
+            return false
+        }
+
+        if isRerouting {
+            return false
+        }
+
+        if let lastRerouteAt,
+           Date().timeIntervalSince(lastRerouteAt) < rerouteCooldown {
+            return false
+        }
+
+        let distanceFromRoute = routeRetriever.route.polyline.distance(to: location)
+        return distanceFromRoute > offRouteThreshold
+    }
+
+    private func reroute(from location: CLLocation) {
+        guard !isRerouting, let destination = selectedDestination else {
+            return
+        }
+
+        rerouteTask?.cancel()
+        isRerouting = true
+        lastRerouteAt = Date()
+        currentInstruction = "Rerouting..."
+
+        rerouteTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                self.isRerouting = false
+                self.rerouteTask = nil
+            }
+
+            do {
+                guard let retriever = try await routeService.fetchRouteRetriever(
+                    for: destination,
+                    from: location.coordinate,
+                    transportType: transportType
+                ) else {
+                    currentInstruction = "No route found"
+                    return
+                }
+
+                applyRoute(retriever.route, retriever: retriever, fitOnMap: true)
+                streamNavigationUpdate(from: location)
+            } catch {
+                if Task.isCancelled { return }
+                currentInstruction = "Unable to reroute"
+                print("Reroute error: \(error)")
+            }
+        }
+    }
+
+    private func streamNavigationUpdate(from location: CLLocation) {
+        guard let routeRetriever,
+              let distanceToTurn = routeRetriever.distanceToCurrentBreakpoint(from: location) else {
+            return
+        }
+
+        let instruction = routeRetriever.currentInstruction
+        currentInstruction = instruction
+        let bucketedDistance = max(0, (Int(distanceToTurn) / 5) * 5)
+
+        bluetoothManager?.sendNavigationUpdate(
+            direction: directionCode(for: instruction),
+            distance: bucketedDistance
+        )
+    }
+
+    private func directionCode(for instruction: String) -> UInt8 {
+        let normalizedInstruction = instruction.lowercased()
+
+        if normalizedInstruction.contains("left") {
+            return 1
+        }
+
+        if normalizedInstruction.contains("right") {
+            return 2
+        }
+
+        return 0
     }
 }

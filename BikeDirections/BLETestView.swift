@@ -9,12 +9,12 @@ import SwiftUI
 
 struct BLETestView: View {
     @StateObject private var bleManager = BluetoothManager()
-    
+
     var body: some View {
         VStack(spacing: 40) {
             Text(bleManager.statusText)
                 .font(.headline)
-            
+
             HStack(spacing: 30) {
                 // LEFT BUTTON
                 Button {
@@ -28,7 +28,7 @@ struct BLETestView: View {
                         .cornerRadius(20)
                 }
                 .disabled(!bleManager.isConnected)
-                
+
                 // RIGHT BUTTON
                 Button {
                     bleManager.sendCommand(2)
