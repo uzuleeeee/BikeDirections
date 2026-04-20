@@ -2,6 +2,7 @@ import Foundation
 import MapKit
 import CoreLocation
 
+// RouteDetails remains exactly the same
 struct RouteDetails {
     let name: String
     let distanceMeters: Double
@@ -30,7 +31,8 @@ struct RouteDetails {
 }
 
 final class RouteService {
-    func fetchRoute(for sr: SearchResult) async throws -> MKRoute? {
+    // 1. Add transportType parameter (default to .walking for biking proxy)
+    func fetchRoute(for sr: SearchResult, transportType: MKDirectionsTransportType = .walking) async throws -> MKRoute? {
         let destination = MKMapItem(
             placemark: MKPlacemark(coordinate: sr.coordinate)
         )
@@ -38,7 +40,9 @@ final class RouteService {
         let request = MKDirections.Request()
         request.source = MKMapItem.forCurrentLocation()
         request.destination = destination
-        request.transportType = .automobile
+        
+        // 2. Apply the dynamic transport type instead of hardcoded .automobile
+        request.transportType = transportType
 
         let directions = MKDirections(request: request)
         let response = try await directions.calculate()
@@ -46,8 +50,9 @@ final class RouteService {
         return response.routes.first
     }
 
-    func fetchRouteRetriever(for sr: SearchResult) async throws -> RouteRetriever? {
-        guard let route = try await fetchRoute(for: sr) else {
+    // 3. Pass the transport type through the retriever fetcher
+    func fetchRouteRetriever(for sr: SearchResult, transportType: MKDirectionsTransportType = .walking) async throws -> RouteRetriever? {
+        guard let route = try await fetchRoute(for: sr, transportType: transportType) else {
             return nil
         }
 
@@ -68,6 +73,7 @@ final class RouteService {
     }
 }
 
+// RouteRetriever and MKPolyline extension remain exactly the same
 final class RouteRetriever {
     let route: MKRoute
     private let navigableSteps: [MKRoute.Step]

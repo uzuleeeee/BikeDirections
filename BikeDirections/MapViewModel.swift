@@ -27,6 +27,8 @@ final class MapViewModel: NSObject, ObservableObject, CLLocationManagerDelegate 
             }
         }
     }
+    
+    @Published var transportType: MKDirectionsTransportType = .walking
 
     private var isSelecting = false
     private var searchTask: Task<Void, Never>?
@@ -139,7 +141,10 @@ final class MapViewModel: NSObject, ObservableObject, CLLocationManagerDelegate 
         guard let destination = selectedDestination else { return }
 
         do {
-            guard let retriever = try await routeService.fetchRouteRetriever(for: destination) else {
+            guard let retriever = try await routeService.fetchRouteRetriever(
+                for: destination,
+                transportType: self.transportType
+            ) else {
                 currentInstruction = "No route found"
                 return
             }
