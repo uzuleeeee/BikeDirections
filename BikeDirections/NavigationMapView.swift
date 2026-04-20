@@ -26,17 +26,32 @@ struct NavigationMapView: UIViewRepresentable {
             mapView.setUserTrackingMode(targetTrackingMode, animated: true)
         }
 
-        syncAnnotations(on: mapView)
-        syncRoute(on: mapView)
+        syncAnnotations(on: mapView, coordinator: context.coordinator)
+        syncRoute(on: mapView, coordinator: context.coordinator)
 
-        if !viewModel.shouldFitRoute {
-            context.coordinator.isDrivingRegionChange = true
+        if viewModel.shouldFitRoute, let routePolyline = viewModel.routePolyline {
+            mapView.setVisibleMapRect(
+                routePolyline.boundingMapRect,
+                edgePadding: UIEdgeInsets(top: 140, left: 40, bottom: 220, right: 40),
+                animated: true
+            )
+            DispatchQueue.main.async {
+                viewModel.didFitRouteOnMap()
+            }
+        } else if viewModel.shouldRecenter {
             mapView.setRegion(viewModel.region, animated: true)
-            context.coordinator.isDrivingRegionChange = false
+            DispatchQueue.main.async {
+                viewModel.didRecenterMap()
+            }
         }
     }
 
-    private func syncAnnotations(on mapView: MKMapView) {
+    private func syncAnnotations(on mapView: MKMapView, coordinator: Coordinator) {
+        let targetKeys = Set(viewModel.annotations.map { "\($0.name)-\($0.coordinate.latitude)-\($0.coordinate.longitude)" })
+        guard targetKeys != coordinator.annotationKeys else { return }
+
+        coordinator.annotationKeys = targetKeys
+
         let nonUserAnnotations = mapView.annotations.filter { !($0 is MKUserLocation) }
         mapView.removeAnnotations(nonUserAnnotations)
 
@@ -51,30 +66,35 @@ struct NavigationMapView: UIViewRepresentable {
         mapView.addAnnotations(destinationAnnotations)
     }
 
-    private func syncRoute(on mapView: MKMapView) {
-        mapView.removeOverlays(mapView.overlays)
+    private func syncRoute(on mapView: MKMapView, coordinator: Coordinator) {
+        let isSameOverlay: Bool = {
+            switch (coordinator.routeOverlay, viewModel.routePolyline) {
+            case (nil, nil):
+                return true
+            case let (existing?, current?):
+                return existing === current
+            default:
+                return false
+            }
+        }()
 
-        guard let routePolyline = viewModel.routePolyline else {
-            return
+        guard !isSameOverlay else { return }
+
+        if let oldOverlay = coordinator.routeOverlay {
+            mapView.removeOverlay(oldOverlay)
         }
 
-        mapView.addOverlay(routePolyline)
+        coordinator.routeOverlay = viewModel.routePolyline
 
-        if viewModel.shouldFitRoute {
-            mapView.setVisibleMapRect(
-                routePolyline.boundingMapRect,
-                edgePadding: UIEdgeInsets(top: 140, left: 40, bottom: 220, right: 40),
-                animated: true
-            )
-            DispatchQueue.main.async {
-                viewModel.didFitRouteOnMap()
-            }
+        if let routePolyline = viewModel.routePolyline {
+            mapView.addOverlay(routePolyline)
         }
     }
 
     final class Coordinator: NSObject, MKMapViewDelegate {
         var parent: NavigationMapView
-        var isDrivingRegionChange = false
+        var routeOverlay: MKPolyline?
+        var annotationKeys: Set<String> = []
 
         init(_ parent: NavigationMapView) {
             self.parent = parent
@@ -92,7 +112,6 @@ struct NavigationMapView: UIViewRepresentable {
         }
 
         func mapView(_ mapView: MKMapView, regionDidChangeAnimated animated: Bool) {
-            guard !isDrivingRegionChange else { return }
             parent.viewModel.region = mapView.region
         }
     }
